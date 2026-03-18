@@ -63,20 +63,26 @@ class TranscriptDesigner:
         # (Note: hairpin_checker is a function, so it doesn't need to be initiated)
         
 
-    def naive_translate(self, protein_sequence):
+    def naive_translate(self, protein_sequence, rbs_utr=""):
+        """
+        Greedy codon selection that minimises local hairpin count.
+        Seeds the sliding window with the RBS UTR so junction hairpins
+        are visible from the very first codon.
+        """
         cds = []
         for i, aa in enumerate(protein_sequence):
             options = self.aminoAcidToCodon.get(aa.upper(), ['NNN'])
             safe = [c for c in options if c not in self.codon_checker.rare_codons]
             pool = safe if safe else options
-            
+
             best_codon = pool[0]
             best_count = float('inf')
             for candidate in pool:
                 test = cds + [candidate]
-                local_seq = ''.join(test)
-                start = max(0, len(local_seq) - 50)
-                count, _ = hairpin_counter(local_seq[start:], 3, 4, 9)
+                # Include the RBS UTR so junction hairpins are counted
+                full_so_far = rbs_utr + ''.join(test)
+                start = max(0, len(full_so_far) - 50)
+                count, _ = hairpin_counter(full_so_far[start:], 3, 4, 9)
                 if count < best_count:
                     best_count = count
                     best_codon = candidate
@@ -118,7 +124,7 @@ class TranscriptDesigner:
     def run(self, peptide: str, ignores: set):
         """
         Translates the peptide to DNA and optimizes it using an Ultra-Fast 
-        Error-State Random Walk with Short-Circuiting and Lazy Evaluation.
+        Error-State Random Walk with RBS-inclusive evaluation.
         """
         try:
             import random
@@ -128,12 +134,20 @@ class TranscriptDesigner:
             clean_regex = re.compile(r'[^ATCGatcg]')
             peptide_len = len(peptide)
             
+            # Pre-select RBS first so naive_translate can see RBS–CDS junction hairpins
+            dummy_cds = "ATG" * len(peptide) + "TAA"
+            selected_rbs = self.rbsChooser.run(dummy_cds, ignores) if self.rbsChooser else None
+            rbs_utr = selected_rbs.utr.upper() if selected_rbs else ""
+
+            # Pre-compute baseline sequence, seeding with the real RBS UTR
+            best_codons = self.naive_translate(peptide, rbs_utr)
+            best_codons.append("TAA")
+
             # Pre-compute safe mutations to avoid lists in the loop
             safe_mutation_map = {}
             for i, aa in enumerate(peptide):
                 aa_upper = aa.upper()
                 possible_codons = self.aminoAcidToCodon.get(aa_upper, [])
-                # WITH THIS:
                 safe = [c for c in possible_codons 
                         if c not in self.codon_checker.rare_codons
                         and self.codon_checker.codon_frequencies.get(c, 0.01) > 0.0]
@@ -145,11 +159,16 @@ class TranscriptDesigner:
             def get_errors_and_diags(test_codons, best_total_errors=None):
                 cds_string = ''.join(test_codons)
                 
-                # Run Fast Checkers First
+                # STAPLE RBS UTR TO THE FRONT FOR STRUCTURAL EVALUATION
+                full_transcript = rbs_utr + cds_string
+                
+                # Codons are only checked against the CDS
                 c_res = self.codon_checker.run(test_codons[:-1])
-                f_res = self.forbidden_checker.run(cds_string)
-                p_res = self.promoter_checker.run(cds_string)
-                g_res = self.gc_checker.run(cds_string)
+                
+                # Structural checkers run on the full transcript
+                f_res = self.forbidden_checker.run(full_transcript)
+                p_res = self.promoter_checker.run(full_transcript)
+                g_res = self.gc_checker.run(full_transcript)
                 
                 p_c = c_res[0] if isinstance(c_res, tuple) else c_res
                 diversity = c_res[1] if isinstance(c_res, tuple) and len(c_res) > 1 else 0.0
@@ -168,17 +187,23 @@ class TranscriptDesigner:
                 if diversity < 0.5: fast_errors += 1
                 if cai < 0.2: fast_errors += 1
                 
-                # THE SHORT CIRCUIT: If fast errors alone make this worse than our best, 
-                # ABORT instantly. Do not run the hairpin checker!
                 if best_total_errors is not None and fast_errors > best_total_errors:
                     return fast_errors + 999, cai, False, None
                 
-                # Run Slow Checker (Only if the fast checkers passed the threshold)
-                h_res = hairpin_checker(cds_string)
+                # Hairpin checks the full transcript — count failing chunks for a real gradient
+                h_res = hairpin_checker(full_transcript)
                 p_h = h_res[0] if isinstance(h_res, tuple) else h_res
                 
                 slow_errors = 0
-                if not p_h: slow_errors += 1
+                if not p_h:
+                    # Count every 50bp chunk with >1 hairpin so the optimizer has a gradient
+                    chunk_size, overlap = 50, 25
+                    failing_chunks = 0
+                    for ci in range(0, len(full_transcript) - chunk_size + 1, overlap):
+                        cnt, _ = hairpin_counter(full_transcript[ci:ci + chunk_size], 3, 4, 9)
+                        if cnt > 1:
+                            failing_chunks += 1
+                    slow_errors += max(1, failing_chunks)
                 
                 total_errors = fast_errors + slow_errors
                 passed_all = (total_errors == 0 and p_c)
@@ -189,9 +214,9 @@ class TranscriptDesigner:
             # 2. THE LAZY TARGETER
             # ==========================================
             def get_bad_indices(test_codons, diags):
-                # We only run this expensive Regex parsing when we actually KEEP a mutation
                 c_res, f_res, p_res, g_res, h_res = diags
                 cds_string = ''.join(test_codons)
+                full_transcript = rbs_utr + cds_string
                 
                 p_c = c_res[0] if isinstance(c_res, tuple) else c_res
                 diversity = c_res[1] if isinstance(c_res, tuple) and len(c_res) > 1 else 0.0
@@ -202,6 +227,8 @@ class TranscriptDesigner:
                 p_h = h_res[0] if isinstance(h_res, tuple) else h_res
                 
                 bad_indices = set()
+                
+                # Convert transcript positions back to codon indices, finding ALL occurrences
                 def extract(data):
                     bad = []
                     if isinstance(data, str):
@@ -210,25 +237,35 @@ class TranscriptDesigner:
                             seq_str = line.split(':')[1] if ':' in line else line
                             clean_seq = clean_regex.sub('', seq_str).upper()
                             if len(clean_seq) >= 4:
-                                idx = cds_string.find(clean_seq)
-                                if idx != -1:
-                                    bad.extend(list(range(idx // 3, (idx + len(clean_seq)) // 3 + 1)))
+                                # Find ALL occurrences, not just the first
+                                search_start = 0
+                                while True:
+                                    idx = full_transcript.find(clean_seq, search_start)
+                                    if idx == -1:
+                                        break
+                                    # Shift index so we don't try to mutate the RBS
+                                    cds_idx = idx - len(rbs_utr)
+                                    start_codon = max(0, cds_idx // 3)
+                                    end_codon = min(peptide_len, (cds_idx + len(clean_seq)) // 3 + 1)
+                                    if end_codon > start_codon:
+                                        bad.extend(list(range(start_codon, end_codon)))
+                                    search_start = idx + 1
                     return bad
 
-                
-                '''if not p_h:
+                if not p_h:
                     chunk_size = 50
                     overlap = 25
-                    cds_string = ''.join(test_codons)
-                    for i in range(0, len(cds_string) - chunk_size + 1, overlap):
-                        chunk = cds_string[i:i + chunk_size]
+                    for i in range(0, len(full_transcript) - chunk_size + 1, overlap):
+                        chunk = full_transcript[i:i + chunk_size]
                         count, _ = hairpin_counter(chunk, 3, 4, 9)
                         if count > 1:
-                            start_codon = i // 3
-                            end_codon = min((i + chunk_size) // 3 + 1, peptide_len)
-                            bad_indices.update(range(start_codon, end_codon))
-                            break  # Target the first failing chunk; subsequent mutations fix the rest'''
-                if not p_h: bad_indices.update(extract(h_res[1] if isinstance(h_res, tuple) else h_res))
+                            cds_start = i - len(rbs_utr)
+                            start_codon = max(0, cds_start // 3)
+                            end_codon = min(peptide_len, (cds_start + chunk_size) // 3 + 1)
+                            if end_codon > start_codon:
+                                bad_indices.update(range(start_codon, end_codon))
+                            # NOTE: no break — collect ALL bad regions
+                            
                 if not p_f: bad_indices.update(extract(f_res[1] if isinstance(f_res, tuple) else f_res))
                 if not p_p: bad_indices.update(extract(p_res[1] if isinstance(p_res, tuple) else p_res))
                 
@@ -249,22 +286,17 @@ class TranscriptDesigner:
             # ==========================================
             # 3. THE OPTIMIZATION LOOP
             # ==========================================
-            best_codons = self.naive_translate(peptide)
-            best_codons.append("TAA")
-            
             best_errors, best_cai, passed, diags = get_errors_and_diags(best_codons)
             if passed:
-                selected_rbs = self.rbsChooser.run(''.join(best_codons), ignores) if self.rbsChooser else None
                 return Transcript(selected_rbs, peptide, best_codons)
                 
             best_bad_indices = get_bad_indices(best_codons, diags)
             
             plateau_count = 0
-            PLATEAU_LIMIT = 150
+            PLATEAU_LIMIT = 250 # Bumped up to give tough genes more leeway
 
-            for attempt in range(5000):
+            for attempt in range(8000): # Bumped up to 8000
                 test_codons = best_codons.copy()
-                # ADD THESE TWO LINES BACK:
                 h_res = diags[4]
                 hairpin_failed = not (h_res[0] if isinstance(h_res, tuple) else h_res)
 
@@ -272,7 +304,8 @@ class TranscriptDesigner:
                 if best_bad_indices:
                     if hairpin_failed:
                         max_burst = min(5, len(best_bad_indices))
-                        num_mutations = random.randint(2, max_burst)
+                        # FIX: Make sure min range <= max range for random.randint
+                        num_mutations = random.randint(2, max_burst) if max_burst >= 2 else 1
                     else:
                         max_burst = min(3, len(best_bad_indices))
                         num_mutations = random.randint(1, max_burst)
@@ -283,28 +316,40 @@ class TranscriptDesigner:
                 valid_mutation_made = False
                 for idx in target_indices:
                     available_moves = [c for c in safe_mutation_map[idx] if c != best_codons[idx]]
-                    # REPLACE:
                     if available_moves:
                         if hairpin_failed:
-                            from genedesign.seq_utils.reverse_complement import reverse_complement
-                            window = test_codons[max(0, idx-15):idx] + test_codons[idx+1:min(peptide_len, idx+16)]
-                            bad = {reverse_complement(c) for c in window}
-                            preferred = [c for c in available_moves if c not in bad]
-                            test_codons[idx] = random.choice(preferred) if preferred else random.choice(available_moves)
+                            # Score each candidate using the same 50bp chunk windows as hairpin_checker
+                            codon_pos = len(rbs_utr) + idx * 3
+                            score_cache = {}
+                            def local_hairpin_score(candidate):
+                                if candidate in score_cache:
+                                    return score_cache[candidate]
+                                trial = test_codons[:idx] + [candidate] + test_codons[idx+1:]
+                                trial_seq = rbs_utr + ''.join(trial)
+                                total = 0
+                                # Use the same 50bp/25bp overlap as hairpin_checker
+                                for w in range(max(0, codon_pos - 49), min(len(trial_seq), codon_pos + 50), 25):
+                                    chunk = trial_seq[w:w + 50]
+                                    if len(chunk) >= 10:
+                                        cnt, _ = hairpin_counter(chunk, 3, 4, 9)
+                                        total += cnt
+                                score_cache[candidate] = total
+                                return total
+                            scores = {c: local_hairpin_score(c) for c in available_moves}
+                            best_score = min(scores.values())
+                            top = [c for c, s in scores.items() if s == best_score]
+                            test_codons[idx] = random.choice(top)
                         else:
                             test_codons[idx] = random.choice(available_moves)
                         valid_mutation_made = True
                 if not valid_mutation_made:
                     continue 
                 
-                # Fast Evaluation (Keep the rest of your loop exactly the same below this!)
                 test_errors, test_cai, test_passed, test_diags = get_errors_and_diags(test_codons, best_errors)
                 
                 if test_passed:
-                    selected_rbs = self.rbsChooser.run(''.join(test_codons), ignores) if self.rbsChooser else None
                     return Transcript(selected_rbs, peptide, test_codons)
                     
-                # Determine if we keep the mutation
                 keep_mutation = False
                 if test_errors < best_errors:
                     keep_mutation = True
@@ -314,7 +359,6 @@ class TranscriptDesigner:
                     elif test_cai >= best_cai:
                         keep_mutation = True
                         
-                # Only if we KEEP the mutation do we overwrite best state and run the Regex Lazy Targeter
                 if keep_mutation:
                     plateau_count = 0
                     best_codons = test_codons
@@ -322,21 +366,39 @@ class TranscriptDesigner:
                     best_cai = test_cai
                     diags = test_diags
                     best_bad_indices = get_bad_indices(best_codons, diags)
-                  
                 else:
                     plateau_count += 1
 
                 if plateau_count >= PLATEAU_LIMIT:
-                    best_codons = self.smart_restart(safe_mutation_map, peptide_len)  # ← changed
-                    best_codons.append("TAA")
-                    best_errors, best_cai, passed, diags = get_errors_and_diags(best_codons)
-                    plateau_count = 0
-                    if passed:
-                        selected_rbs = self.rbsChooser.run(''.join(best_codons), ignores)
-                        return Transcript(selected_rbs, peptide, best_codons)
-                    best_bad_indices = get_bad_indices(best_codons, diags)
+                    # Last-mile exhaustive sweep: if only one error type remains,
+                    # try every synonymous codon at every bad position before restarting.
+                    if best_errors == 1 and best_bad_indices:
+                        for sweep_idx in list(best_bad_indices):
+                            for candidate in safe_mutation_map[sweep_idx]:
+                                if candidate == best_codons[sweep_idx]:
+                                    continue
+                                sweep_codons = best_codons.copy()
+                                sweep_codons[sweep_idx] = candidate
+                                s_err, s_cai, s_passed, s_diags = get_errors_and_diags(sweep_codons)
+                                if s_passed:
+                                    return Transcript(selected_rbs, peptide, sweep_codons)
+                                if s_err < best_errors:
+                                    best_codons, best_errors, best_cai, diags = sweep_codons, s_err, s_cai, s_diags
+                                    best_bad_indices = get_bad_indices(best_codons, diags)
+                                    plateau_count = 0
+                                    break
+                            if plateau_count == 0:
+                                break
 
-            # If it fails, unpack the diags and crash cleanly
+                    if plateau_count >= PLATEAU_LIMIT:  # still stuck — full restart
+                        best_codons = self.smart_restart(safe_mutation_map, peptide_len)
+                        best_codons.append("TAA")
+                        best_errors, best_cai, passed, diags = get_errors_and_diags(best_codons)
+                        plateau_count = 0
+                        if passed:
+                            return Transcript(selected_rbs, peptide, best_codons)
+                        best_bad_indices = get_bad_indices(best_codons, diags)
+
             c_res, f_res, p_res, g_res, h_res = diags
             print(f"\n--- DIAGNOSTIC FOR {peptide[:10]} ---")
             print(f"Codon Output: {c_res}")
