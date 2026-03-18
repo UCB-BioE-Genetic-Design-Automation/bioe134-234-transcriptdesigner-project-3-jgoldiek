@@ -5,6 +5,7 @@ from genedesign.checkers.internal_promoter_checker import PromoterChecker
 from genedesign.checkers.gc_content_checker import GCContentChecker
 from genedesign.models.transcript import Transcript
 from genedesign.seq_utils.hairpin_counter import hairpin_counter
+from genedesign.rbs_chooser import RBSChooser
 
 # Importing the hairpin checker directly as a function
 from genedesign.checkers.hairpin_checker import hairpin_checker 
@@ -15,17 +16,19 @@ class TranscriptDesigner:
         # 1. The original required variables (Don't change these names!)
         self.aminoAcidToCodon = {}
         self.rbsChooser = None
-
-        # 2. Your new checker tools
-        self.codon_checker = CodonChecker()
-        self.forbidden_checker = ForbiddenSequenceChecker()
-        self.promoter_checker = PromoterChecker()
-        self.gc_checker = GCContentChecker()
     
     def initiate(self):
         """
         Signals readiness to the benchmarker and sets up the required data.
         """
+        # 2. Your new checker tools
+        self.codon_checker = CodonChecker()
+        self.forbidden_checker = ForbiddenSequenceChecker()
+        self.promoter_checker = PromoterChecker()
+        self.gc_checker = GCContentChecker()
+        self.rbsChooser = RBSChooser()
+        self.rbsChooser.initiate()
+
         # 1. Populate the dictionary the original code expects
         self.aminoAcidToCodon = {
             'A': ['GCG', 'GCC', 'GCA', 'GCT'],
@@ -59,9 +62,6 @@ class TranscriptDesigner:
         
         # (Note: hairpin_checker is a function, so it doesn't need to be initiated)
         
-        # 3. If you have an RBS chooser, initiate it if it exists
-        if self.rbsChooser is not None:
-            self.rbsChooser.initiate()
 
     def naive_translate(self, protein_sequence):
         cds = []
@@ -332,7 +332,7 @@ class TranscriptDesigner:
                     best_errors, best_cai, passed, diags = get_errors_and_diags(best_codons)
                     plateau_count = 0
                     if passed:
-                        selected_rbs = self.rbsChooser.run(''.join(best_codons), ignores) if self.rbsChooser else None
+                        selected_rbs = self.rbsChooser.run(''.join(best_codons), ignores)
                         return Transcript(selected_rbs, peptide, best_codons)
                     best_bad_indices = get_bad_indices(best_codons, diags)
 
