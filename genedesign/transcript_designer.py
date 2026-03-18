@@ -133,7 +133,10 @@ class TranscriptDesigner:
             for i, aa in enumerate(peptide):
                 aa_upper = aa.upper()
                 possible_codons = self.aminoAcidToCodon.get(aa_upper, [])
-                safe = [c for c in possible_codons if c not in self.codon_checker.rare_codons]
+                # WITH THIS:
+                safe = [c for c in possible_codons 
+                        if c not in self.codon_checker.rare_codons
+                        and self.codon_checker.codon_frequencies.get(c, 0.01) > 0.0]
                 safe_mutation_map[i] = safe if safe else possible_codons
 
             # ==========================================
