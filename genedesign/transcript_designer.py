@@ -262,7 +262,7 @@ class TranscriptDesigner:
             plateau_count = 0
             PLATEAU_LIMIT = 150
 
-            for attempt in range(1000):
+            for attempt in range(5000):
                 test_codons = best_codons.copy()
                 # ADD THESE TWO LINES BACK:
                 h_res = diags[4]
